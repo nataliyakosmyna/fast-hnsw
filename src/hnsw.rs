@@ -1205,12 +1205,41 @@ impl<D: Distance> Hnsw<D> {
         ef: usize,
         workspace: &mut SearchWorkspace,
     ) -> Result<Vec<SearchResult>> {
-        self.check_query_dim(query)?;
-        self.search_with_distance_and_workspace(
+        self.try_search_with_workspace_map(
+            query,
+            k,
+            ef,
+            workspace,
+            Ok,
+        )
+    }
+
+    /// Search and transform each result directly into the caller's output type.
+    ///
+    /// Traversal still reuses [`SearchWorkspace`], while the returned vector is
+    /// allocated once for `T`. This avoids first materializing an intermediate
+    /// `Vec<SearchResult>` in adapters that immediately decode or convert every
+    /// result. A transform error stops conversion without invalidating the
+    /// reusable workspace.
+    pub fn try_search_with_workspace_map<T, E, M>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+        map: M,
+    ) -> std::result::Result<Vec<T>, E>
+    where
+        E: From<Error>,
+        M: FnMut(SearchResult) -> std::result::Result<T, E>,
+    {
+        self.check_query_dim(query).map_err(E::from)?;
+        self.try_search_with_distance_and_workspace_map(
             k,
             ef,
             |id| self.metric.distance(query, self.vec_store.get(id)),
             workspace,
+            map,
         )
     }
 
@@ -1245,22 +1274,40 @@ impl<D: Distance> Hnsw<D> {
     where
         F: Fn(usize) -> f32,
     {
+        self.try_search_with_distance_and_workspace_map(k, ef, distance, workspace, Ok)
+    }
+
+    /// External-distance search that transforms workspace results directly.
+    pub fn try_search_with_distance_and_workspace_map<T, E, F, M>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        workspace: &mut SearchWorkspace,
+        mut map: M,
+    ) -> std::result::Result<Vec<T>, E>
+    where
+        E: From<Error>,
+        F: Fn(usize) -> f32,
+        M: FnMut(SearchResult) -> std::result::Result<T, E>,
+    {
         // Tombstoned nodes must stay navigable but never surface as results,
         // which is exactly the filtered traversal's semantics.  Routing through
         // it keeps the deletion check in one place; indexes with no deletions
         // keep using the cheaper unfiltered path below.
         if self.deleted_count > 0 {
-            return self.search_filtered_with_distance_and_workspace(
+            return self.try_search_filtered_with_distance_and_workspace_map(
                 k,
                 ef,
                 distance,
                 |_| true,
                 workspace,
+                map,
             );
         }
 
         if k == 0 {
-            return Err(Error::ZeroK);
+            return Err(E::from(Error::ZeroK));
         }
         let ef = ef.max(k);
 
@@ -1302,9 +1349,14 @@ impl<D: Distance> Hnsw<D> {
             &distance,
         );
         scratch.out.truncate(k);
-        Ok(scratch.out.iter()
-            .map(|d| SearchResult { id: d.id, distance: d.dist })
-            .collect())
+        let mut output = Vec::with_capacity(scratch.out.len());
+        for result in &scratch.out {
+            output.push(map(SearchResult {
+                id: result.id,
+                distance: result.dist,
+            })?);
+        }
+        Ok(output)
     }
 
     /// Search while applying an eligibility predicate during layer-0
@@ -1356,13 +1408,39 @@ impl<D: Distance> Hnsw<D> {
     where
         F: Fn(usize) -> bool,
     {
-        self.check_query_dim(query)?;
-        self.search_filtered_with_distance_and_workspace(
+        self.try_search_filtered_with_workspace_map(
+            query,
+            k,
+            ef,
+            accepts,
+            workspace,
+            Ok,
+        )
+    }
+
+    /// Filtered search that transforms workspace results directly.
+    pub fn try_search_filtered_with_workspace_map<T, E, F, M>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+        workspace: &mut SearchWorkspace,
+        map: M,
+    ) -> std::result::Result<Vec<T>, E>
+    where
+        E: From<Error>,
+        F: Fn(usize) -> bool,
+        M: FnMut(SearchResult) -> std::result::Result<T, E>,
+    {
+        self.check_query_dim(query).map_err(E::from)?;
+        self.try_search_filtered_with_distance_and_workspace_map(
             k,
             ef,
             |id| self.metric.distance(query, self.vec_store.get(id)),
             accepts,
             workspace,
+            map,
         )
     }
 
@@ -1402,8 +1480,29 @@ impl<D: Distance> Hnsw<D> {
         F: Fn(usize) -> f32,
         A: Fn(usize) -> bool,
     {
+        self.try_search_filtered_with_distance_and_workspace_map(
+            k, ef, distance, accepts, workspace, Ok,
+        )
+    }
+
+    /// Filtered external-distance search that transforms workspace results directly.
+    pub fn try_search_filtered_with_distance_and_workspace_map<T, E, F, A, M>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        accepts: A,
+        workspace: &mut SearchWorkspace,
+        mut map: M,
+    ) -> std::result::Result<Vec<T>, E>
+    where
+        E: From<Error>,
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
+        M: FnMut(SearchResult) -> std::result::Result<T, E>,
+    {
         if k == 0 {
-            return Err(Error::ZeroK);
+            return Err(E::from(Error::ZeroK));
         }
         let ef = ef.max(k);
 
@@ -1454,14 +1553,14 @@ impl<D: Distance> Hnsw<D> {
             &distance,
         );
         scratch.out.truncate(k);
-        Ok(scratch
-            .out
-            .iter()
-            .map(|result| SearchResult {
+        let mut output = Vec::with_capacity(scratch.out.len());
+        for result in &scratch.out {
+            output.push(map(SearchResult {
                 id: result.id,
                 distance: result.dist,
-            })
-            .collect())
+            })?);
+        }
+        Ok(output)
     }
 
     // ─── Exact search ─────────────────────────────────────────────────────
