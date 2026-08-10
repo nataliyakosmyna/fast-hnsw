@@ -3,25 +3,28 @@
 //! Every kernel here computes exactly what the portable fold computes, only
 //! faster; none of them trade accuracy for speed.  Each has a scalar
 //! `*_portable` reference, and the test suite asserts the vector path agrees
-//! with it across every length class, so a mis-written intrinsic fails loudly
-//! rather than silently returning slightly wrong distances.
+//! with it across every length class. AArch64 additionally preserves the
+//! portable fold bit-for-bit so enabling SIMD cannot silently steer HNSW
+//! construction toward a different graph.
 //!
 //! # Why hand-written intrinsics at all
 //!
 //! The portable folds already auto-vectorise: LLVM turns the eight-accumulator
 //! L2 fold into `ldp q…` + `fsub.4s` + `fmul.4s` on AArch64, processing eight
-//! floats per iteration.  Writing the intrinsics by hand still helps, because
-//! it pins down three things the optimiser will not commit to on its own:
-//! four 128-bit accumulators instead of two (more instruction-level
-//! parallelism), a fused multiply-add instead of separate `fmul`/`fadd`, and —
-//! for L1 — AArch64's single-instruction absolute difference `fabd`.
+//! floats per iteration. Writing the intrinsics by hand still helps because it
+//! guarantees vector loads and arithmetic without relying on loop recognition,
+//! and — for L1 — uses AArch64's single-instruction absolute difference `fabd`.
+//! The NEON kernels deliberately mirror the portable fold's eight logical
+//! lanes, separate multiply/add, and final reduction order. That costs some
+//! peak micro-kernel throughput but prevents last-bit distance changes from
+//! producing a different, slower HNSW graph.
 //!
 //! Measured against the auto-vectorised fold, NEON on Apple silicon:
 //!
 //! | dim | L2 auto | L2 NEON |       | L1 auto | L1 NEON |       |
 //! |-----|---------|---------|-------|---------|---------|-------|
-//! | 128 | 13.2 ns | 6.2 ns  | 2.14x | 11.2 ns | 6.1 ns  | 1.85x |
-//! | 768 | 77.7 ns | 37.9 ns | 2.05x | 65.9 ns | 47.7 ns | 1.38x |
+//! | 128 | 13.8 ns | 8.8 ns  | 1.57x | 11.6 ns | 8.6 ns  | 1.35x |
+//! | 768 | 80.4 ns | 59.6 ns | 1.35x | 68.8 ns | 55.4 ns | 1.24x |
 //!
 //! AVX2 gains more, because the portable fold has further to fall on x86 --
 //! measured on an i9-12900H and a Ryzen 9 8945HS (L2, portable -> AVX2):
@@ -137,6 +140,20 @@ portable_fold!(dot_portable, |x, y| x * y);
 mod neon {
     use std::arch::aarch64::*;
 
+    /// Reduce the portable fold's eight logical lanes in the same order.
+    ///
+    /// # Safety
+    /// Both arguments are initialized NEON values and `lanes` has room for
+    /// both four-float stores.
+    #[inline(always)]
+    unsafe fn reduce_eight_lanes(acc0: float32x4_t, acc1: float32x4_t) -> f32 {
+        let mut lanes = [0.0_f32; 8];
+        vst1q_f32(lanes.as_mut_ptr(), acc0);
+        vst1q_f32(lanes.as_mut_ptr().add(4), acc1);
+        ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+            + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]))
+    }
+
     /// Sum of squared differences over the common prefix.
     ///
     /// # Safety
@@ -149,25 +166,17 @@ mod neon {
         let n = a.len().min(b.len());
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
         unsafe {
-            let mut acc = [vdupq_n_f32(0.0); 4];
+            let mut acc = [vdupq_n_f32(0.0); 2];
             let mut i = 0;
-            while i + 16 <= n {
+            while i + 8 <= n {
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let offset = i + lane * 4;
                     let d = vsubq_f32(vld1q_f32(pa.add(offset)), vld1q_f32(pb.add(offset)));
-                    *acc = vfmaq_f32(*acc, d, d);
+                    *acc = vaddq_f32(*acc, vmulq_f32(d, d));
                 }
-                i += 16;
+                i += 8;
             }
-            while i + 4 <= n {
-                let d = vsubq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
-                acc[0] = vfmaq_f32(acc[0], d, d);
-                i += 4;
-            }
-            let mut sum = vaddvq_f32(vaddq_f32(
-                vaddq_f32(acc[0], acc[1]),
-                vaddq_f32(acc[2], acc[3]),
-            ));
+            let mut sum = reduce_eight_lanes(acc[0], acc[1]);
             while i < n {
                 let d = *pa.add(i) - *pb.add(i);
                 sum += d * d;
@@ -199,7 +208,7 @@ mod neon {
                 );
                 i += 8;
             }
-            let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+            let mut sum = reduce_eight_lanes(acc0, acc1);
             while i < n {
                 sum += (*pa.add(i) - *pb.add(i)).abs();
                 i += 1;
@@ -217,23 +226,23 @@ mod neon {
         let n = a.len().min(b.len());
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
         unsafe {
-            let mut acc = [vdupq_n_f32(0.0); 4];
+            // Match the portable fold's eight logical lanes and reduction
+            // order. HNSW construction is comparison-driven, so changing the
+            // last bit of a distance can select a different graph even when
+            // the kernel is numerically equivalent within a tolerance.
+            let mut acc = [vdupq_n_f32(0.0); 2];
             let mut i = 0;
-            while i + 16 <= n {
+            while i + 8 <= n {
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let offset = i + lane * 4;
-                    *acc = vfmaq_f32(*acc, vld1q_f32(pa.add(offset)), vld1q_f32(pb.add(offset)));
+                    *acc = vaddq_f32(
+                        *acc,
+                        vmulq_f32(vld1q_f32(pa.add(offset)), vld1q_f32(pb.add(offset))),
+                    );
                 }
-                i += 16;
+                i += 8;
             }
-            while i + 4 <= n {
-                acc[0] = vfmaq_f32(acc[0], vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
-                i += 4;
-            }
-            let mut sum = vaddvq_f32(vaddq_f32(
-                vaddq_f32(acc[0], acc[1]),
-                vaddq_f32(acc[2], acc[3]),
-            ));
+            let mut sum = reduce_eight_lanes(acc[0], acc[1]);
             while i < n {
                 sum += *pa.add(i) * *pb.add(i);
                 i += 1;
@@ -605,6 +614,39 @@ mod tests {
             assert!(close(fast, reference), "dot at len {len}: {fast} vs {reference}");
             let (fast, reference) = (norm_squared(&a), dot_portable(&a, &a));
             assert!(close(fast, reference), "norm_squared at len {len}: {fast} vs {reference}");
+        }
+    }
+
+    /// AArch64 graph construction must not depend on whether the default SIMD
+    /// feature is enabled. HNSW is comparison-driven, so even a last-bit
+    /// difference from FMA contraction or horizontal reduction can select a
+    /// different graph and materially change build memory and query latency.
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    #[test]
+    fn neon_kernels_are_bit_stable_with_portable_folds() {
+        for len in [
+            0usize, 1, 3, 4, 7, 8, 9, 15, 16, 31, 32, 63, 64, 100, 127, 128, 129, 384, 768,
+            769,
+        ] {
+            for offset in [0usize, 1, 11, 97] {
+                let a = sample(len, offset);
+                let b = sample(len, offset + 23);
+                assert_eq!(
+                    l2_squared(&a, &b).to_bits(),
+                    l2_squared_portable(&a, &b).to_bits(),
+                    "l2_squared at len {len}, offset {offset}"
+                );
+                assert_eq!(
+                    l1(&a, &b).to_bits(),
+                    l1_portable(&a, &b).to_bits(),
+                    "l1 at len {len}, offset {offset}"
+                );
+                assert_eq!(
+                    dot(&a, &b).to_bits(),
+                    dot_portable(&a, &b).to_bits(),
+                    "dot at len {len}, offset {offset}"
+                );
+            }
         }
     }
 
