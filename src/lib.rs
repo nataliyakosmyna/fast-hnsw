@@ -303,6 +303,53 @@ mod tests {
             index.search_with_workspace(&query, 10, 100, &mut workspace).unwrap(),
             index.search(&query, 10, 100).unwrap()
         );
+
+        let transformed = index
+            .try_search_with_workspace_map(
+                &query,
+                10,
+                50,
+                &mut workspace,
+                |result| Ok::<_, Error>((result.id, result.distance.to_bits())),
+            )
+            .expect("result transform failed");
+        assert_eq!(
+            transformed,
+            expected
+                .iter()
+                .map(|result| (result.id, result.distance.to_bits()))
+                .collect::<Vec<_>>()
+        );
+
+        let transformed_filtered = index
+            .try_search_filtered_with_workspace_map(
+                &query,
+                10,
+                50,
+                |id| id % 3 == 0,
+                &mut workspace,
+                |result| Ok::<_, Error>((result.id, result.distance.to_bits())),
+            )
+            .expect("filtered result transform failed");
+        assert_eq!(
+            transformed_filtered,
+            expected_filtered
+                .iter()
+                .map(|result| (result.id, result.distance.to_bits()))
+                .collect::<Vec<_>>()
+        );
+
+        let transform_error = index.try_search_with_workspace_map(
+            &query,
+            10,
+            50,
+            &mut workspace,
+            |_| Err::<(), _>(std::io::Error::other("transform failed")),
+        );
+        assert_eq!(
+            transform_error.expect_err("transform should fail").to_string(),
+            "transform failed"
+        );
     }
 
     #[test]
@@ -343,6 +390,45 @@ mod tests {
                 &mut workspace,
             ).unwrap(),
             index.search_filtered(&query, 10, 75, |id| id % 4 == 0).unwrap()
+        );
+
+        let transformed = index
+            .try_search_with_distance_and_workspace_map(
+                10,
+                75,
+                distance,
+                &mut workspace,
+                |result| Ok::<_, Error>((result.id, result.distance.to_bits())),
+            )
+            .expect("external-distance transform failed");
+        assert_eq!(
+            transformed,
+            index
+                .search(&query, 10, 75)
+                .unwrap()
+                .iter()
+                .map(|result| (result.id, result.distance.to_bits()))
+                .collect::<Vec<_>>()
+        );
+
+        let transformed_filtered = index
+            .try_search_filtered_with_distance_and_workspace_map(
+                10,
+                75,
+                distance,
+                |id| id % 4 == 0,
+                &mut workspace,
+                |result| Ok::<_, Error>((result.id, result.distance.to_bits())),
+            )
+            .expect("filtered external-distance transform failed");
+        assert_eq!(
+            transformed_filtered,
+            index
+                .search_filtered(&query, 10, 75, |id| id % 4 == 0)
+                .unwrap()
+                .iter()
+                .map(|result| (result.id, result.distance.to_bits()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1946,6 +2032,22 @@ mod tests {
             actual.iter().map(|result| result.id).collect::<Vec<_>>(),
             expected.iter().map(|result| result.id).collect::<Vec<_>>()
         );
+        let transformed = mapped
+            .search_map_with_workspace(
+                &query,
+                10,
+                100,
+                &mut workspace,
+                |result| (result.id, result.payload),
+            )
+            .expect("mapped result transform failed");
+        assert_eq!(
+            transformed,
+            expected
+                .iter()
+                .map(|result| (result.id, result.payload))
+                .collect::<Vec<_>>()
+        );
         let expected = mapped
             .search_filtered(&query, 10, 200, |id, _| id % 7 == 0)
             .expect("mapped filtered search failed");
@@ -1961,6 +2063,23 @@ mod tests {
         assert_eq!(
             actual.iter().map(|result| result.id).collect::<Vec<_>>(),
             expected.iter().map(|result| result.id).collect::<Vec<_>>()
+        );
+        let transformed = mapped
+            .search_filtered_map_with_workspace(
+                &query,
+                10,
+                200,
+                |id, _| id % 7 == 0,
+                &mut workspace,
+                |result| (result.id, result.payload),
+            )
+            .expect("mapped filtered result transform failed");
+        assert_eq!(
+            transformed,
+            expected
+                .iter()
+                .map(|result| (result.id, result.payload))
+                .collect::<Vec<_>>()
         );
     }
 

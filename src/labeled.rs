@@ -61,7 +61,7 @@ use std::cell::RefCell;
 use crate::Builder;
 use crate::distance::Distance;
 use crate::error::Result;
-use crate::hnsw::{Config, Hnsw, SearchResult, SearchWorkspace};
+use crate::hnsw::{Config, Hnsw, SearchWorkspace};
 use crate::payload::Payload;
 use crate::persist::{self, MappedPayloads};
 
@@ -354,7 +354,9 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
         k: usize,
         ef: usize,
     ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
-        self.decode_results(self.inner.search(query, k, ef)?)
+        crate::hnsw::with_query_workspace(|workspace| {
+            self.search_with_workspace(query, k, ef, workspace)
+        })
     }
 
     /// Search while retaining traversal allocations in a caller-owned
@@ -366,24 +368,40 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
         ef: usize,
         workspace: &mut SearchWorkspace,
     ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
-        self.decode_results(self.inner.search_with_workspace(query, k, ef, workspace)?)
+        self.search_map_with_workspace(query, k, ef, workspace, |result| result)
     }
 
-    fn decode_results<'a>(
+    /// Search and transform decoded mapped results directly into the output type.
+    ///
+    /// This avoids materializing an intermediate `Vec<SearchResult>` or
+    /// `Vec<MappedLabeledResult>` when an adapter immediately converts mapped
+    /// results into its own public representation, and sizes the returned
+    /// allocation for `T` directly.
+    pub fn search_map_with_workspace<'a, T, M>(
         &'a self,
-        results: Vec<SearchResult>,
-    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
-        results
-            .into_iter()
-            .map(|result| {
-                Ok(MappedLabeledResult {
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+        mut map: M,
+    ) -> io::Result<Vec<T>>
+    where
+        M: FnMut(MappedLabeledResult<'a, L>) -> T,
+    {
+        self.inner.try_search_with_workspace_map(
+            query,
+            k,
+            ef,
+            workspace,
+            |result| {
+                Ok(map(MappedLabeledResult {
                     id: result.id,
                     distance: result.distance,
                     payload: self.payloads.get(result.id)?,
                     embedding: self.inner.get_vector(result.id)?,
-                })
-            })
-            .collect()
+                }))
+            },
+        )
     }
 
     /// Search with filter-before-top-k eligibility over lazily decoded
@@ -417,8 +435,32 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
     where
         F: Fn(usize, &L) -> bool,
     {
+        self.search_filtered_map_with_workspace(
+            query,
+            k,
+            ef,
+            accepts,
+            workspace,
+            |result| result,
+        )
+    }
+
+    /// Filter-before-top-k search that transforms decoded results directly.
+    pub fn search_filtered_map_with_workspace<'a, T, F, M>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+        workspace: &mut SearchWorkspace,
+        mut map: M,
+    ) -> io::Result<Vec<T>>
+    where
+        F: Fn(usize, &L) -> bool,
+        M: FnMut(MappedLabeledResult<'a, L>) -> T,
+    {
         let decode_error = RefCell::new(None);
-        let results = self.inner.search_filtered_with_workspace(
+        let results = self.inner.try_search_filtered_with_workspace_map(
             query,
             k,
             ef,
@@ -430,12 +472,20 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
                 }
             },
             workspace,
-        )?;
+            |result| {
+                Ok(map(MappedLabeledResult {
+                    id: result.id,
+                    distance: result.distance,
+                    payload: self.payloads.get(result.id)?,
+                    embedding: self.inner.get_vector(result.id)?,
+                }))
+            },
+        );
         if let Some(error) = decode_error.into_inner() {
             return Err(error);
         }
 
-        self.decode_results(results)
+        results
     }
 
     /// Decode one payload directly from the mapped column.
