@@ -597,6 +597,7 @@ impl MappedQuantizedVectors {
         sums.into_iter().sum::<f32>() * scale
     }
 
+    #[cfg(feature = "hnsw")]
     #[inline]
     fn distance_prepared_validated(&self, query: &PreparedQuantizedQuery, row: usize) -> f32 {
         1.0 - self.score_prepared_validated(query, row)
