@@ -177,7 +177,9 @@ struct CodecParameters {
     bits: u8,
     config: QuantizedConfig,
     signs: Vec<f32>,
-    levels: Vec<f32>,
+    /// Reconstruction levels padded to the 4-bit code space so a masked code
+    /// always indexes in bounds; only the first `1 << bits` entries are levels.
+    level_table: [f32; 16],
     boundaries: Vec<f32>,
 }
 
@@ -194,6 +196,8 @@ impl CodecParameters {
             .windows(2)
             .map(|window| 0.5 * (window[0] + window[1]))
             .collect();
+        let mut level_table = [0.0; 16];
+        level_table[..levels.len()].copy_from_slice(&levels);
         Ok(Self {
             dimensions,
             padded_dimensions,
@@ -201,7 +205,7 @@ impl CodecParameters {
             bits: config.bits,
             config,
             signs,
-            levels,
+            level_table,
             boundaries,
         })
     }
@@ -264,7 +268,7 @@ impl CodecParameters {
                 .boundaries
                 .partition_point(|boundary| *boundary < value);
             pack_code(&mut codes, self.bits, dimension, code as u8);
-            let level = self.levels[code];
+            let level = self.level_table[code];
             reconstruction_norm_squared = level.mul_add(level, reconstruction_norm_squared);
         }
         if reconstruction_norm_squared <= f32::EPSILON {
@@ -552,49 +556,16 @@ impl MappedQuantizedVectors {
                 .try_into()
                 .expect("validated four-byte scale slot"),
         );
-        let mut sums = [0.0_f32; 8];
         debug_assert_eq!(query.rotated.len() % 8, 0);
-        match self.metadata.config.bits {
-            2 => {
-                let code_chunks = codes.chunks_exact(2);
-                debug_assert!(code_chunks.remainder().is_empty());
-                for (bytes, query) in code_chunks.zip(query.rotated.chunks_exact(8)) {
-                    for (group, byte) in bytes.iter().copied().enumerate() {
-                        let first = group * 4;
-                        for lane in 0..4 {
-                            let code = usize::from((byte >> (lane * 2)) & 0x03);
-                            sums[first + lane] += query[first + lane] * self.parameters.levels[code];
-                        }
-                    }
-                }
-            }
-            3 => {
-                let code_chunks = codes.chunks_exact(3);
-                debug_assert!(code_chunks.remainder().is_empty());
-                for (bytes, query) in code_chunks.zip(query.rotated.chunks_exact(8)) {
-                    let packed =
-                        u32::from(bytes[0]) | u32::from(bytes[1]) << 8 | u32::from(bytes[2]) << 16;
-                    for lane in 0..8 {
-                        let code = ((packed >> (lane * 3)) & 0x07) as usize;
-                        sums[lane] += query[lane] * self.parameters.levels[code];
-                    }
-                }
-            }
-            4 => {
-                let code_chunks = codes.chunks_exact(4);
-                debug_assert!(code_chunks.remainder().is_empty());
-                for (bytes, query) in code_chunks.zip(query.rotated.chunks_exact(8)) {
-                    for (pair, code) in bytes.iter().copied().enumerate() {
-                        let first = pair * 2;
-                        sums[first] += query[first] * self.parameters.levels[usize::from(code & 0x0f)];
-                        sums[first + 1] +=
-                            query[first + 1] * self.parameters.levels[usize::from(code >> 4)];
-                    }
-                }
-            }
+        let query = query.rotated.as_slice();
+        let levels = &self.parameters.level_table;
+        let sum = match self.metadata.config.bits {
+            2 => accumulate_row_codes::<2>(query, codes, levels),
+            3 => accumulate_row_codes::<3>(query, codes, levels),
+            4 => accumulate_row_codes::<4>(query, codes, levels),
             _ => unreachable!("bit width was validated while opening"),
-        }
-        sums.into_iter().sum::<f32>() * scale
+        };
+        sum * scale
     }
 
     #[inline]
@@ -1037,6 +1008,34 @@ fn pack_code(output: &mut [u8], bits: u8, index: usize, value: u8) {
     }
 }
 
+/// Each `BITS`-byte chunk of `codes` packs eight consecutive dimensions.
+/// Dimension `8 * chunk + lane` accumulates into `sums[lane]` with a separate
+/// multiply and add; changing that association changes score bits.
+#[inline(always)]
+fn accumulate_row_codes<const BITS: usize>(
+    query: &[f32],
+    codes: &[u8],
+    levels: &[f32; 16],
+) -> f32 {
+    let mask = (1_u32 << BITS) - 1;
+    let code_chunks = codes.chunks_exact(BITS);
+    debug_assert!(code_chunks.remainder().is_empty());
+    let mut sums = [0.0_f32; 8];
+    let code_chunks =
+        code_chunks.map(|chunk| -> [u8; BITS] { chunk.try_into().expect("exact code chunk") });
+    for (query, bytes) in query.chunks_exact(8).zip(code_chunks) {
+        let packed = bytes
+            .iter()
+            .rev()
+            .fold(0_u32, |packed, byte| packed << 8 | u32::from(*byte));
+        for (lane, (sum, value)) in sums.iter_mut().zip(query).enumerate() {
+            let code = (packed >> (lane * BITS)) & mask;
+            *sum += value * levels[code as usize];
+        }
+    }
+    sums.into_iter().sum::<f32>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1357,80 @@ mod tests {
             QuantizedHnsw::new(&wrong_dimensions, &mapped),
             Err(QuantizedError::IncompatibleIndex(_))
         ));
+    }
+
+    /// Byte-at-a-time scorer kept as the bit-exact reference for the per-row kernel.
+    fn reference_row_score(
+        mapped: &MappedQuantizedVectors,
+        query: &PreparedQuantizedQuery,
+        row: usize,
+    ) -> f32 {
+        let stride = mapped.metadata.row_stride;
+        let codes = &mapped.image[mapped.codes_offset + row * stride..][..stride];
+        let levels = &mapped.parameters.level_table[..1 << mapped.metadata.config.bits];
+        let mut sums = [0.0_f32; 8];
+        for (chunk, query) in query.rotated.chunks_exact(8).enumerate() {
+            match mapped.metadata.config.bits {
+                2 => {
+                    for group in 0..2 {
+                        let byte = codes[chunk * 2 + group];
+                        for lane in 0..4 {
+                            let code = usize::from((byte >> (lane * 2)) & 0x03);
+                            sums[group * 4 + lane] += query[group * 4 + lane] * levels[code];
+                        }
+                    }
+                }
+                3 => {
+                    let packed = u32::from(codes[chunk * 3])
+                        | u32::from(codes[chunk * 3 + 1]) << 8
+                        | u32::from(codes[chunk * 3 + 2]) << 16;
+                    for lane in 0..8 {
+                        let code = ((packed >> (lane * 3)) & 0x07) as usize;
+                        sums[lane] += query[lane] * levels[code];
+                    }
+                }
+                4 => {
+                    for pair in 0..4 {
+                        let code = codes[chunk * 4 + pair];
+                        sums[pair * 2] += query[pair * 2] * levels[usize::from(code & 0x0f)];
+                        sums[pair * 2 + 1] += query[pair * 2 + 1] * levels[usize::from(code >> 4)];
+                    }
+                }
+                bits => unreachable!("unsupported test width {bits}"),
+            }
+        }
+        sums.into_iter().sum::<f32>()
+            * read_scale(&mapped.image, mapped.scales_offset, row).unwrap()
+    }
+
+    #[test]
+    fn per_row_scorer_is_bit_identical_to_reference() {
+        for dimensions in [7, 10, 384, 1_000] {
+            let vectors = vectors(dimensions, 70);
+            for metric in [QuantizedMetric::Cosine, QuantizedMetric::DotProduct] {
+                for bits in QuantizedConfig::MIN_BITS..=QuantizedConfig::MAX_BITS {
+                    let file = tempfile::NamedTempFile::new().unwrap();
+                    MappedQuantizedVectors::save(
+                        file.path(),
+                        dimensions,
+                        metric,
+                        QuantizedConfig::with_bits(bits).unwrap(),
+                        &vectors,
+                    )
+                    .unwrap();
+                    let mapped = open_verified(file.path()).unwrap();
+                    for query_row in [0, 17, 69] {
+                        let prepared = mapped.prepare_query(&vectors[query_row]).unwrap();
+                        for row in 0..mapped.len() {
+                            assert_eq!(
+                                mapped.score_prepared(&prepared, row).unwrap().to_bits(),
+                                reference_row_score(&mapped, &prepared, row).to_bits(),
+                                "{dimensions}d q{bits} {metric:?} query {query_row} row {row}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
